@@ -291,10 +291,7 @@ static uint32_t bytesToInt(uint8_t* src) {
     return value;
 }
 
-
-
-static bool ff_avpacket_is_idr(const AVPacket* pkt) {
-
+static bool ff_avpacket_is_idr_h264(const AVPacket* pkt) {
     int state = -1;
 
     if (pkt->data && pkt->size >= 5) {
@@ -312,6 +309,31 @@ static bool ff_avpacket_is_idr(const AVPacket* pkt) {
     return false;
 }
 
+static bool ff_avpacket_is_idr_hevc(const AVPacket* pkt) {
+    uint32_t code = -1;
+    int irap = 0;
+    int i;
+
+    for (i = 0; i < pkt->size - 1; i++) {
+        code = (code << 8) + pkt->data[i];
+        if ((code & 0xffffff00) == 0x100) {
+            uint8_t nal2 = pkt->data[i + 1];
+            int type = (code & 0x7E) >> 1;
+
+            if (code & 0x81) // forbidden and reserved zero bits
+                return 0;
+
+            if (nal2 & 0xf8) // reserved zero
+                return 0;
+            switch (type) {
+            case 19:
+            case 20:  irap++; break;
+            }
+        }
+    }
+    return irap > 0;
+}
+
 static bool ff_avpacket_is_key(const AVPacket* pkt) {
     if (pkt->flags & AV_PKT_FLAG_KEY) {
         return true;
@@ -320,9 +342,19 @@ static bool ff_avpacket_is_key(const AVPacket* pkt) {
     }
 }
 
-static bool ff_avpacket_i_or_idr(const AVPacket* pkt,bool isIdr) {
+static bool ff_avpacket_is_idr(const AVPacket* pkt,enum AVCodecID codec_id) {
+    if (!ff_avpacket_is_key(pkt)) {
+        return false;
+    }
+    if (codec_id == AV_CODEC_ID_HEVC) {
+        return ff_avpacket_is_idr_hevc(pkt);
+    }
+    return ff_avpacket_is_idr_h264(pkt);
+}
+
+static bool ff_avpacket_i_or_idr(const AVPacket* pkt,bool isIdr,enum AVCodecID codec_id) {
     if (isIdr == true) {
-        return ff_avpacket_is_idr(pkt);
+        return ff_avpacket_is_idr(pkt, codec_id);
     } else {
         return ff_avpacket_is_key(pkt);
     }

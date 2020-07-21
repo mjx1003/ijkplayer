@@ -26,6 +26,7 @@
 #include "ffpipeline_ios.h"
 #include <mach/mach_time.h>
 #include "libavformat/avc.h"
+#include "libavformat/hevc.h"
 #include "ijksdl_vout_ios_gles2.h"
 #include "h264_sps_parser.h"
 #include "ijkplayer/ff_ffplay_debug.h"
@@ -623,7 +624,10 @@ static inline void DuplicatePkt(Ijk_VideoToolBox_Opaque* context, const AVPacket
         ResetPktBuffer(context);
     }
     AVPacket* avpkt = &context->m_buffer_packet[context->m_buffer_deep];
-    av_copy_packet(avpkt, pkt);
+    av_packet_ref(avpkt, pkt);
+    if (context->m_buffer_deep == 0) {
+        context->idr_based_identified = ff_avpacket_is_idr(pkt, context->codecpar->codec_id);
+    }
     context->m_buffer_deep++;
 }
 
@@ -683,10 +687,10 @@ static int decode_video(Ijk_VideoToolBox_Opaque* context, AVCodecContext *avctx,
             avcodec_free_context(&new_avctx);
         }
     } else {
-        if (ff_avpacket_is_idr(avpkt) == true) {
+        if (ff_avpacket_is_idr(avpkt, context->codecpar->codec_id) == true) {
             context->idr_based_identified = true;
         }
-        if (ff_avpacket_i_or_idr(avpkt, context->idr_based_identified) == true) {
+        if (ff_avpacket_i_or_idr(avpkt, context->idr_based_identified, context->codecpar->codec_id) == true) {
             ResetPktBuffer(context);
             context->recovery_drop_packet = false;
         }
@@ -708,7 +712,7 @@ static int decode_video(Ijk_VideoToolBox_Opaque* context, AVCodecContext *avctx,
             return -1;
 
         if ((context->m_buffer_deep > 0) &&
-            ff_avpacket_i_or_idr(&context->m_buffer_packet[0], context->idr_based_identified) == true ) {
+            ff_avpacket_i_or_idr(&context->m_buffer_packet[0], context->idr_based_identified, context->codecpar->codec_id) == true ) {
             for (int i = 0; i < context->m_buffer_deep; i++) {
                 AVPacket* pkt = &context->m_buffer_packet[i];
                 ret = decode_video_internal(context, avctx, pkt, got_picture_ptr);
@@ -992,14 +996,21 @@ static int vtbformat_init(VTBFormatDesc *fmt_desc, AVCodecParameters *codecpar)
                     }
 
                     fmt_desc->convert_bytestream = true;
-                    ff_isom_write_avcc(pb, extradata, extrasize);
+                    if (codec == AV_CODEC_ID_HEVC) {
+                        ff_isom_write_hvcc(pb, extradata, extrasize, 1);
+                    } else {
+                        ff_isom_write_avcc(pb, extradata, extrasize);
+                    }
                     extradata = NULL;
 
                     extrasize = avio_close_dyn_buf(pb, &extradata);
-
-                    if (!validate_avcC_spc(extradata, extrasize, &fmt_desc->max_ref_frames, &sps_level, &sps_profile)) {
-                        av_free(extradata);
-                        goto fail;
+                    if (codec != AV_CODEC_ID_HEVC) {
+                        if (!validate_avcC_spc(extradata, extrasize, &fmt_desc->max_ref_frames, &sps_level, &sps_profile)) {
+                            av_free(extradata);
+                            goto fail;
+                        }
+                    } else {
+                        fmt_desc->max_ref_frames = 5;
                     }
 
             fmt_desc->fmt_desc = CreateFormatDescriptionFromCodecData(format_id, width, height, extradata, extrasize, IJK_VTB_FCC_AVCC);
