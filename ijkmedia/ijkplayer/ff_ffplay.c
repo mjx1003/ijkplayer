@@ -4413,7 +4413,8 @@ int ffp_seek_to_l(FFPlayer *ffp, long msec)
     // FIXME: 9 seek out of range
     // FIXME: 9 seekable
     av_log(ffp, AV_LOG_DEBUG, "stream_seek %"PRId64"(%d) + %"PRId64", \n", seek_pos, (int)msec, start_time);
-    stream_seek(is, seek_pos, 0, 0);
+    int64_t pos = (int64_t)ffp_get_current_position_l(ffp);
+    stream_seek(is, seek_pos, msec - pos, 0);
     return 0;
 }
 
