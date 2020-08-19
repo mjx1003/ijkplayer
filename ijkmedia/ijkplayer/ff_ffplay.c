@@ -4395,6 +4395,7 @@ int ffp_seek_to_l(FFPlayer *ffp, long msec)
     int64_t start_time = 0;
     int64_t seek_pos = milliseconds_to_fftime(msec);
     int64_t duration = milliseconds_to_fftime(ffp_get_duration_l(ffp));
+    int64_t pos = milliseconds_to_fftime(ffp_get_current_position_l(ffp));
 
     if (!is)
         return EIJK_NULL_IS_PTR;
@@ -4406,15 +4407,20 @@ int ffp_seek_to_l(FFPlayer *ffp, long msec)
     }
 
     start_time = is->ic->start_time;
-    if (start_time > 0 && start_time != AV_NOPTS_VALUE)
+    if (start_time > 0 && start_time != AV_NOPTS_VALUE) {
         seek_pos += start_time;
+        pos += start_time;
+    }
 
     // FIXME: 9 seek by bytes
     // FIXME: 9 seek out of range
     // FIXME: 9 seekable
     av_log(ffp, AV_LOG_DEBUG, "stream_seek %"PRId64"(%d) + %"PRId64", \n", seek_pos, (int)msec, start_time);
-    int64_t pos = (int64_t)ffp_get_current_position_l(ffp);
-    stream_seek(is, seek_pos, msec - pos, 0);
+    int64_t rel = 0;
+    if (pos != 0 && seek_pos < pos) {
+        rel = seek_pos - pos;
+    }
+    stream_seek(is, seek_pos, rel, 0);
     return 0;
 }
 
