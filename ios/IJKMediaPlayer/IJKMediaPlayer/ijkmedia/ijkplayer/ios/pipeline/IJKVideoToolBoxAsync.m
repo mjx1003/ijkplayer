@@ -1121,6 +1121,9 @@ static int vtbformat_init(VTBFormatDesc *fmt_desc, AVCodecParameters *codecpar)
         if (fmt_desc->fmt_desc == NULL) {
             goto fail;
         }
+        if (codec == AV_CODEC_ID_HEVC) {
+            fmt_desc->max_ref_frames = 5;
+        }
 
                 ALOGI("%s - using avcC atom of size(%d), ref_frames(%d)", __FUNCTION__, extrasize, fmt_desc->max_ref_frames);
             } else {

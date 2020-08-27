@@ -986,6 +986,9 @@ static int vtbformat_init(VTBFormatDesc *fmt_desc, AVCodecParameters *codecpar)
             goto fail;
         }
 
+        if (codec == AV_CODEC_ID_HEVC) {
+            fmt_desc->max_ref_frames = 5;
+        }
                 ALOGI("%s - using avcC atom of size(%d), ref_frames(%d)", __FUNCTION__, extrasize, fmt_desc->max_ref_frames);
             } else {
                 if ((extradata[0] == 0 && extradata[1] == 0 && extradata[2] == 0 && extradata[3] == 1) ||
