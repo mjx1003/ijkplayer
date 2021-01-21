@@ -709,6 +709,7 @@ typedef struct FFPlayer {
     AVApplicationContext *app_ctx;
     IjkIOManagerContext *ijkio_manager_ctx;
 
+    int seek_avoid_flush;
     int enable_accurate_seek;
     int accurate_seek_timeout;
     int mediacodec_sync;
@@ -797,6 +798,7 @@ inline static void ffp_reset_internal(FFPlayer *ffp)
     ffp->start_on_prepared      = 1;
     ffp->first_video_frame_rendered = 0;
     ffp->sync_av_start          = 1;
+    ffp->seek_avoid_flush       = 0;
     ffp->enable_accurate_seek   = 0;
     ffp->accurate_seek_timeout  = MAX_ACCURATE_SEEK_TIMEOUT;
 

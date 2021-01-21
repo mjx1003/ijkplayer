@@ -3057,6 +3057,256 @@ static int is_realtime(AVFormatContext *s)
     return 0;
 }
 
+
+/*
+ * scan for min&max pts of the packet-queue
+ */
+static bool scan_packetqueue_min_max_pts(PacketQueue *q, int64_t *ptr_min_pts, int64_t *ptr_max_pts ) {
+    int64_t minPts = AV_NOPTS_VALUE;
+    int64_t maxPts = AV_NOPTS_VALUE;
+
+    MyAVPacketList *pki;
+    for( pki = q->first_pkt; pki; pki = pki->next ) {
+        if(pki->pkt.data == flush_pkt.data){
+            continue;
+        }
+        if(pki->pkt.pts == AV_NOPTS_VALUE){
+            continue;
+        }
+        if( minPts == AV_NOPTS_VALUE ) { // pick first pts for minPts
+            minPts = pki->pkt.pts;
+        }
+        if(pki->pkt.pts >= minPts) { // always save to max-pts when iterating pkt item
+            maxPts = pki->pkt.pts;
+        }
+    }
+    bool ok = minPts!=AV_NOPTS_VALUE && maxPts!=AV_NOPTS_VALUE;
+    if(ok) {
+        *ptr_min_pts = minPts;
+        *ptr_max_pts = maxPts;
+    }
+    return ok;
+}
+
+static void bbc_dump_stream_q_info( const char *prefix, FFPlayer *ffp, AVStream *st, PacketQueue *q ) {
+    VideoState *is = ffp->is;
+
+    int64_t start_time = 0;
+    int64_t cur_pos = milliseconds_to_fftime(ffp_get_current_position_l(ffp));
+    start_time = is->ic->start_time;
+    if (start_time > 0 && start_time != AV_NOPTS_VALUE) {
+        cur_pos += start_time;
+    }
+
+    int64_t seek_pos = is->seek_pos; // in AV_TIME_BASE
+    double f1 = av_q2d( AV_TIME_BASE_Q );
+    double seekPos = seek_pos * f1;
+
+    double startTime = start_time * f1;
+    double curPos = cur_pos * f1;
+
+    int64_t min_pts = 0; // in st->time_base
+    int64_t max_pts = 0; // in st->time_base
+    scan_packetqueue_min_max_pts(q, &min_pts, &max_pts);
+
+    double f2 = av_q2d( st->time_base );
+    double minPts = min_pts * f2;
+    double maxPts = max_pts * f2;
+
+    double durationS = q->duration * f2;
+
+    av_log(NULL, AV_LOG_ERROR, "bbc_dump_stream_q_info()[%s] : .st->time_base=(%d/%d) .q->nb_packets=%d .q->size=%d .q->duration=%lld( %.4f s ) .q->serial=%d .q->is_buffer_indicator=%d .startTime=%.4f .curPos=%.4f .seekPos=%.4f .minPts=%.4f .maxPts=%.4f(max_pts=%lld(0x%llx))\n",
+            prefix,
+            st->time_base.num, st->time_base.den,
+            q->nb_packets,
+            q->size,
+            q->duration, durationS,
+            q->serial,
+            q->is_buffer_indicator,
+            startTime,
+            curPos,
+            seekPos,
+            minPts,
+            maxPts, max_pts, max_pts
+            );
+}
+
+/*
+ * seek within a stream's buffering range
+ */
+static bool seek_within_stream_buffering_range( const char *prefix,
+                                                FFPlayer *ffp,
+                                                AVStream *st,
+                                                PacketQueue *q,
+                                                double seekPos
+                                                )
+{
+    av_log(NULL, AV_LOG_ERROR, "seek_within_stream_buffering_range()[%s] entered .seekPos=%.4f\n",
+                    prefix,
+                    seekPos
+                );
+
+    if( ! (q->first_pkt && q->last_pkt) ) {
+        av_log(NULL, AV_LOG_ERROR, "line#%d - %s() return FALSE \n", __LINE__, __FUNCTION__ );
+        return false;
+    }
+
+    int64_t min_pts = 0l;
+    int64_t max_pts = 0l;
+    if( ! scan_packetqueue_min_max_pts(q, &min_pts, &max_pts) ) {
+        av_log(NULL, AV_LOG_ERROR, "line#%d - %s() return FALSE \n", __LINE__, __FUNCTION__ );
+        return false;
+    }
+
+    double timeBase = av_q2d( st->time_base );
+    double firstPktPts = min_pts * timeBase;
+    double lastPktPts = max_pts * timeBase;
+    if( ! (firstPktPts<=seekPos && seekPos<=lastPktPts) ) {
+        av_log(NULL, AV_LOG_ERROR, "line#%d - %s() return FALSE \n", __LINE__, __FUNCTION__ );
+        return false;
+    }
+
+    MyAVPacketList *keyPki = NULL;
+    MyAVPacketList *pki = NULL;
+    double streamTimeBaseQ = av_q2d( st->time_base );
+    SDL_LockMutex(q->mutex);
+    pki = q->first_pkt;
+    while(pki) { // scan for key-frame packet
+        double pts = pki->pkt.pts*streamTimeBaseQ;
+        if(seekPos <= pts) {//寻找最接近seekPos的关键帧
+            if(pki->pkt.flags&AV_PKT_FLAG_KEY){//是否关键帧
+                keyPki = pki;
+            }
+            break;
+        }
+        if(pki->pkt.flags&AV_PKT_FLAG_KEY){
+            keyPki = pki;
+        }
+        pki = pki->next;
+    }
+    if(!keyPki) {
+        SDL_UnlockMutex(q->mutex);
+        av_log(NULL, AV_LOG_ERROR, "line#%d - %s() return FALSE \n", __LINE__, __FUNCTION__ );
+        return false;
+    }
+
+    // prepare a MyAVPacketList for the cloned flush_pkt
+    MyAVPacketList *flushPktClone = NULL;//从recycle_pkt中复用一个节点
+    flushPktClone = q->recycle_pkt;
+    if (flushPktClone) {
+        q->recycle_pkt = flushPktClone->next;
+        q->recycle_count++;
+    } else {
+        q->alloc_count++;
+        flushPktClone = av_malloc(sizeof(MyAVPacketList));
+    }
+    if(!flushPktClone) {
+        SDL_UnlockMutex(q->mutex);
+        av_log(NULL, AV_LOG_ERROR, "line#%d - %s() return FALSE \n", __LINE__, __FUNCTION__ );
+        return false;
+    }
+
+    // discard all packets before the keyPki
+    int discardPkiNum = 0;//把那个关键帧之前的所有节点移动到复用池
+    while(q->first_pkt!=keyPki) {
+        pki = q->first_pkt;
+        q->first_pkt = q->first_pkt->next;
+        //recycle pki
+        av_packet_unref(&pki->pkt);
+        pki->next = q->recycle_pkt;
+        q->recycle_pkt = pki;
+
+        discardPkiNum++;
+    }
+    av_log(NULL, AV_LOG_ERROR, "seek_within_stream_buffering_range()[%s] discardPkiNum = %d \n",
+                    prefix, discardPkiNum
+                );
+
+    // prepend flush_pkt to q
+    flushPktClone->next = q->first_pkt;
+    flushPktClone->pkt = flush_pkt;
+    q->first_pkt = flushPktClone;//头插flush_pkt
+    // update q & remaining pki in the list
+    pki = q->first_pkt;
+    int serial = q->serial;
+    q->nb_packets = 0;
+    q->size = 0;
+    q->duration = (int64_t)0;
+    while(pki) {
+        if(pki->pkt.data == flush_pkt.data) {
+            serial++;
+        }
+        pki->serial = serial;
+        q->nb_packets++;
+        q->size += pki->pkt.size + sizeof(*pki);
+        if(pki->pkt.data != flush_pkt.data) {
+            q->duration += FFMAX(pki->pkt.duration, MIN_PKT_DURATION);
+        }
+
+        if(! pki->next ) {
+            q->last_pkt = pki;
+        }
+        pki = pki->next;
+    }
+    q->serial = serial; // set q->serial as last serial
+    SDL_CondSignal(q->cond);
+    SDL_UnlockMutex(q->mutex);
+    av_log(NULL, AV_LOG_ERROR, "seek_within_stream_buffering_range()[%s] return TRUE \n",
+                prefix
+            );
+    av_log(NULL, AV_LOG_ERROR, "line#%d - %s() return TRUE \n", __LINE__, __FUNCTION__ );
+    return true;
+}
+
+/*
+ * If seek_pos within buffering range, handle it and return true.
+ */
+static bool handle_seek_within_buffering_range(FFPlayer *ffp) {
+    av_log(NULL, AV_LOG_ERROR, "handle_seek_within_buffering_range() : ffp->seek_avoid_flush = %d \n", ffp->seek_avoid_flush );
+    if( ! ffp->seek_avoid_flush ) {
+        return false;
+    }
+
+    VideoState *is = ffp->is;
+
+    int64_t seek_pos = is->seek_pos; // in AV_TIME_BASE
+    double seekPos = seek_pos * av_q2d( AV_TIME_BASE_Q );
+
+    int streamsNum = 0;
+    int successStreamsNum = 0;
+
+    if (is->audio_stream >= 0) {
+        streamsNum++;
+        bbc_dump_stream_q_info("audio-before", ffp, is->audio_st, &is->audioq );
+        if( seek_within_stream_buffering_range("audio", ffp, is->audio_st, &is->audioq, seekPos) ) {
+            successStreamsNum++;
+        }
+        bbc_dump_stream_q_info("audio-after", ffp, is->audio_st, &is->audioq );
+    }
+    if (is->subtitle_stream >= 0) {
+        streamsNum++;
+        bbc_dump_stream_q_info("subtitle-before", ffp, is->subtitle_st, &is->subtitleq );
+        if( seek_within_stream_buffering_range("subtitle", ffp, is->subtitle_st, &is->subtitleq, seekPos) ) {
+            successStreamsNum++;
+        }
+        bbc_dump_stream_q_info("subtitle-after", ffp, is->subtitle_st, &is->subtitleq );
+    }
+    if (is->video_stream >= 0) {
+        streamsNum++;
+        bbc_dump_stream_q_info("video-before", ffp, is->video_st, &is->videoq );
+        if( seek_within_stream_buffering_range("video", ffp, is->video_st, &is->videoq, seekPos) ) {
+            if (ffp->node_vdec) {
+                ffpipenode_flush(ffp->node_vdec);
+            }
+            successStreamsNum++;
+        }
+        bbc_dump_stream_q_info("video-after", ffp, is->video_st, &is->videoq );
+    }
+
+    bool ok = streamsNum == successStreamsNum;
+    return ok;
+}
+
 /* this thread gets the stream from the disk or the network */
 static int read_thread(void *arg)
 {
@@ -3366,84 +3616,139 @@ static int read_thread(void *arg)
         }
 #endif
         if (is->seek_req) {
-            int64_t seek_target = is->seek_pos;
-            int64_t seek_min    = is->seek_rel > 0 ? seek_target - is->seek_rel + 2: INT64_MIN;
-            int64_t seek_max    = is->seek_rel < 0 ? seek_target - is->seek_rel - 2: INT64_MAX;
-// FIXME the +-2 is due to rounding being not done in the correct direction in generation
-//      of the seek_pos/seek_rel variables
+            if( handle_seek_within_buffering_range(ffp) ) {
+                ret = 0;
 
-            ffp_toggle_buffering(ffp, 1);
-            ffp_notify_msg3(ffp, FFP_MSG_BUFFERING_UPDATE, 0, 0);
-            ret = avformat_seek_file(is->ic, -1, seek_min, seek_target, seek_max, is->seek_flags);
-            if (ret < 0) {
-                av_log(NULL, AV_LOG_ERROR,
-                       "%s: error while seeking\n", is->ic->filename);
-            } else {
-                if (is->audio_stream >= 0) {
-                    packet_queue_flush(&is->audioq);
-                    packet_queue_put(&is->audioq, &flush_pkt);
-                    // TODO: clear invaild audio data
-                    // SDL_AoutFlushAudio(ffp->aout);
+                int64_t seek_target = is->seek_pos;
+
+                {
+                    is->latest_video_seek_load_serial = is->videoq.serial;
+                    is->latest_audio_seek_load_serial = is->audioq.serial;
+                    is->latest_seek_load_start_at = av_gettime();
                 }
-                if (is->subtitle_stream >= 0) {
-                    packet_queue_flush(&is->subtitleq);
-                    packet_queue_put(&is->subtitleq, &flush_pkt);
+
+                ffp->dcc.current_high_water_mark_in_ms = ffp->dcc.first_high_water_mark_in_ms;
+                is->seek_req = 0;
+                is->queue_attachments_req = 1;
+                is->eof = 0;
+                #ifdef FFP_MERGE
+                if (is->paused)
+                    step_to_next_frame(is);
+                #endif
+                completed = 0;
+                SDL_LockMutex(ffp->is->play_mutex);
+                if (ffp->auto_resume) {
+                    is->pause_req = 0;
+                    if (ffp->packet_buffering)
+                        is->buffering_on = 1;
+                    ffp->auto_resume = 0;
+                    stream_update_pause_l(ffp);
                 }
-                if (is->video_stream >= 0) {
-                    if (ffp->node_vdec) {
-                        ffpipenode_flush(ffp->node_vdec);
+                if (is->pause_req)
+                    step_to_next_frame_l(ffp);
+                SDL_UnlockMutex(ffp->is->play_mutex);
+
+                if (ffp->enable_accurate_seek) {
+                    is->drop_aframe_count = 0;
+                    is->drop_vframe_count = 0;
+                    SDL_LockMutex(is->accurate_seek_mutex);
+                    if (is->video_stream >= 0) {
+                        is->video_accurate_seek_req = 1;
                     }
-                    packet_queue_flush(&is->videoq);
-                    packet_queue_put(&is->videoq, &flush_pkt);
+                    if (is->audio_stream >= 0) {
+                        is->audio_accurate_seek_req = 1;
+                    }
+                    SDL_CondSignal(is->audio_accurate_seek_cond);
+                    SDL_CondSignal(is->video_accurate_seek_cond);
+                    SDL_UnlockMutex(is->accurate_seek_mutex);
                 }
-                if (is->seek_flags & AVSEEK_FLAG_BYTE) {
-                   set_clock(&is->extclk, NAN, 0);
+
+                ffp_notify_msg3(ffp, FFP_MSG_SEEK_COMPLETE, (int)fftime_to_milliseconds(seek_target), ret);
+                ffp_toggle_buffering(ffp, 1);
+
+            } else {
+                int64_t seek_target = is->seek_pos;
+                int64_t seek_min    = is->seek_rel > 0 ? seek_target - is->seek_rel + 2: INT64_MIN;
+                int64_t seek_max    = is->seek_rel < 0 ? seek_target - is->seek_rel - 2: INT64_MAX;
+                // FIXME the +-2 is due to rounding being not done in the correct direction in generation
+                //      of the seek_pos/seek_rel variables
+
+                ffp_toggle_buffering(ffp, 1);
+                ffp_notify_msg3(ffp, FFP_MSG_BUFFERING_UPDATE, 0, 0);
+                ret = avformat_seek_file(is->ic, -1, seek_min, seek_target, seek_max, is->seek_flags);
+                if (ret < 0) {
+                    av_log(NULL, AV_LOG_ERROR,
+                        "%s: error while seeking\n", is->ic->filename);
                 } else {
-                   set_clock(&is->extclk, seek_target / (double)AV_TIME_BASE, 0);
+                    av_log(NULL, AV_LOG_ERROR, "avformat_seek_file() OK return .ret=%d(0x%x)\n", ret, ret);
+
+                    if (is->audio_stream >= 0) {
+                        packet_queue_flush(&is->audioq);
+                        packet_queue_put(&is->audioq, &flush_pkt);
+                        // TODO: clear invaild audio data
+                        // SDL_AoutFlushAudio(ffp->aout);
+                    }
+                    if (is->subtitle_stream >= 0) {
+                        packet_queue_flush(&is->subtitleq);
+                        packet_queue_put(&is->subtitleq, &flush_pkt);
+                    }
+                    if (is->video_stream >= 0) {
+                        if (ffp->node_vdec) {
+                            ffpipenode_flush(ffp->node_vdec);
+                        }
+                        packet_queue_flush(&is->videoq);
+                        packet_queue_put(&is->videoq, &flush_pkt);
+                    }
+                    if (is->seek_flags & AVSEEK_FLAG_BYTE) {
+                    set_clock(&is->extclk, NAN, 0);
+                    } else {
+                    set_clock(&is->extclk, seek_target / (double)AV_TIME_BASE, 0);
+                    }
+
+                    is->latest_video_seek_load_serial = is->videoq.serial;
+                    is->latest_audio_seek_load_serial = is->audioq.serial;
+                    is->latest_seek_load_start_at = av_gettime();
+                }
+                ffp->dcc.current_high_water_mark_in_ms = ffp->dcc.first_high_water_mark_in_ms;
+                is->seek_req = 0;
+                is->queue_attachments_req = 1;
+                is->eof = 0;
+                #ifdef FFP_MERGE
+                if (is->paused)
+                    step_to_next_frame(is);
+                #endif
+                completed = 0;
+                SDL_LockMutex(ffp->is->play_mutex);
+                if (ffp->auto_resume) {
+                    is->pause_req = 0;
+                    if (ffp->packet_buffering)
+                        is->buffering_on = 1;
+                    ffp->auto_resume = 0;
+                    stream_update_pause_l(ffp);
+                }
+                if (is->pause_req)
+                    step_to_next_frame_l(ffp);
+                SDL_UnlockMutex(ffp->is->play_mutex);
+
+                if (ffp->enable_accurate_seek) {
+                    is->drop_aframe_count = 0;
+                    is->drop_vframe_count = 0;
+                    SDL_LockMutex(is->accurate_seek_mutex);
+                    if (is->video_stream >= 0) {
+                        is->video_accurate_seek_req = 1;
+                    }
+                    if (is->audio_stream >= 0) {
+                        is->audio_accurate_seek_req = 1;
+                    }
+                    SDL_CondSignal(is->audio_accurate_seek_cond);
+                    SDL_CondSignal(is->video_accurate_seek_cond);
+                    SDL_UnlockMutex(is->accurate_seek_mutex);
                 }
 
-                is->latest_video_seek_load_serial = is->videoq.serial;
-                is->latest_audio_seek_load_serial = is->audioq.serial;
-                is->latest_seek_load_start_at = av_gettime();
-            }
-            ffp->dcc.current_high_water_mark_in_ms = ffp->dcc.first_high_water_mark_in_ms;
-            is->seek_req = 0;
-            is->queue_attachments_req = 1;
-            is->eof = 0;
-#ifdef FFP_MERGE
-            if (is->paused)
-                step_to_next_frame(is);
-#endif
-            completed = 0;
-            SDL_LockMutex(ffp->is->play_mutex);
-            if (ffp->auto_resume) {
-                is->pause_req = 0;
-                if (ffp->packet_buffering)
-                    is->buffering_on = 1;
-                ffp->auto_resume = 0;
-                stream_update_pause_l(ffp);
-            }
-            if (is->pause_req)
-                step_to_next_frame_l(ffp);
-            SDL_UnlockMutex(ffp->is->play_mutex);
-
-            if (ffp->enable_accurate_seek) {
-                is->drop_aframe_count = 0;
-                is->drop_vframe_count = 0;
-                SDL_LockMutex(is->accurate_seek_mutex);
-                if (is->video_stream >= 0) {
-                    is->video_accurate_seek_req = 1;
-                }
-                if (is->audio_stream >= 0) {
-                    is->audio_accurate_seek_req = 1;
-                }
-                SDL_CondSignal(is->audio_accurate_seek_cond);
-                SDL_CondSignal(is->video_accurate_seek_cond);
-                SDL_UnlockMutex(is->accurate_seek_mutex);
+                ffp_notify_msg3(ffp, FFP_MSG_SEEK_COMPLETE, (int)fftime_to_milliseconds(seek_target), ret);
+                ffp_toggle_buffering(ffp, 1);
             }
 
-            ffp_notify_msg3(ffp, FFP_MSG_SEEK_COMPLETE, (int)fftime_to_milliseconds(seek_target), ret);
-            ffp_toggle_buffering(ffp, 1);
         }
         if (is->queue_attachments_req) {
             if (is->video_st && (is->video_st->disposition & AV_DISPOSITION_ATTACHED_PIC)) {

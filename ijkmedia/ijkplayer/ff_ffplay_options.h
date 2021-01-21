@@ -154,6 +154,8 @@ static const AVOption ffp_context_options[] = {
 
     { "enable-accurate-seek",                      "enable accurate seek",
         OPTION_OFFSET(enable_accurate_seek),       OPTION_INT(0, 0, 1) },
+    { "seek-avoid-flush",                      "seek avoid flush",
+        OPTION_OFFSET(seek_avoid_flush),       OPTION_INT(0, 0, 1) },
     { "accurate-seek-timeout",                      "accurate seek timeout",
         OPTION_OFFSET(accurate_seek_timeout),       OPTION_INT(MAX_ACCURATE_SEEK_TIMEOUT, 0, MAX_ACCURATE_SEEK_TIMEOUT) },
     { "skip-calc-frame-rate",                      "don't calculate real frame rate",
