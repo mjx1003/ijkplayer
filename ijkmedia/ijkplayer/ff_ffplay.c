@@ -3307,6 +3307,45 @@ static bool handle_seek_within_buffering_range(FFPlayer *ffp) {
     return ok;
 }
 
+static int bbc_buffer_is_full( FFPlayer *ffp ) {
+    VideoState *is = ffp->is;
+    // check by size
+    if( (is->audioq.size + is->videoq.size + is->subtitleq.size) > ffp->dcc.max_buffer_size ) {
+        return 1;
+    }
+
+    // check by duration
+    int maxDurationValue = ffp->dcc.max_buffer_duration_seconds;
+    if( maxDurationValue <= 0 ) {
+        return 0;
+    }
+    double maxBufferDurationSeconds = 1.0 * maxDurationValue;
+    AVStream *st = NULL;
+    PacketQueue *q = NULL;
+    if (is->audio_stream >= 0) {
+        st = is->audio_st;
+        q = &is->audioq;
+        if( q->duration * av_q2d( st->time_base ) < maxBufferDurationSeconds ) {
+            return 0;
+        }
+    }
+    if (is->video_stream >= 0) {
+        st = is->video_st;
+        q = &is->videoq;
+        if( q->duration * av_q2d( st->time_base ) < maxBufferDurationSeconds ) {
+            return 0;
+        }
+    }
+    if (is->subtitle_stream >= 0) {
+        st = is->subtitle_st;
+        q = &is->subtitleq;
+        if( q->duration * av_q2d( st->time_base ) < maxBufferDurationSeconds ) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 /* this thread gets the stream from the disk or the network */
 static int read_thread(void *arg)
 {
@@ -3766,7 +3805,7 @@ static int read_thread(void *arg)
 #ifdef FFP_MERGE
               (is->audioq.size + is->videoq.size + is->subtitleq.size > MAX_QUEUE_SIZE
 #else
-              (is->audioq.size + is->videoq.size + is->subtitleq.size > ffp->dcc.max_buffer_size
+              ( bbc_buffer_is_full(ffp) // is->audioq.size + is->videoq.size + is->subtitleq.size > ffp->dcc.max_buffer_size
 #endif
             || (   stream_has_enough_packets(is->audio_st, is->audio_stream, &is->audioq, MIN_FRAMES)
                 && stream_has_enough_packets(is->video_st, is->video_stream, &is->videoq, MIN_FRAMES)

@@ -527,6 +527,9 @@ inline static void ffp_reset_statistic(FFStatistic *dcc)
 
 typedef struct FFDemuxCacheControl
 {
+    // >0 means max buffer controlled by duration, otherwise by buffer size.
+    int max_buffer_duration_seconds;
+
     int min_frames;
     int max_buffer_size;
     int high_water_mark_in_bytes;
@@ -539,6 +542,8 @@ typedef struct FFDemuxCacheControl
 
 inline static void ffp_reset_demux_cache_control(FFDemuxCacheControl *dcc)
 {
+    dcc->max_buffer_duration_seconds = 0;
+
     dcc->min_frames                = DEFAULT_MIN_FRAMES;
     dcc->max_buffer_size           = MAX_QUEUE_SIZE;
     dcc->high_water_mark_in_bytes  = DEFAULT_HIGH_WATER_MARK_IN_BYTES;

@@ -120,6 +120,8 @@ static const AVOption ffp_context_options[] = {
         OPTION_OFFSET(pictq_size),          OPTION_INT(VIDEO_PICTURE_QUEUE_SIZE_DEFAULT,
                                                        VIDEO_PICTURE_QUEUE_SIZE_MIN,
                                                        VIDEO_PICTURE_QUEUE_SIZE_MAX) },
+    { "max-buffer-duration-seconds",                    "max buffer duration seconds",
+        OPTION_OFFSET(dcc.max_buffer_duration_seconds), OPTION_INT(0, 0, INT_MAX) },
 
     { "max-buffer-size",                    "max buffer size should be pre-read",
         OPTION_OFFSET(dcc.max_buffer_size), OPTION_INT(MAX_QUEUE_SIZE, 0, MAX_QUEUE_SIZE) },
