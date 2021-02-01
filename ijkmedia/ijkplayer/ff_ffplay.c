@@ -3138,23 +3138,18 @@ static bool seek_within_stream_buffering_range( const char *prefix,
                                                 FFPlayer *ffp,
                                                 AVStream *st,
                                                 PacketQueue *q,
-                                                double seekPos
+                                               double seekPos,
+                                               int searchNearestKeyFrame,
+                                               double *realPos
                                                 )
 {
-    av_log(NULL, AV_LOG_ERROR, "seek_within_stream_buffering_range()[%s] entered .seekPos=%.4f\n",
-                    prefix,
-                    seekPos
-                );
-
     if( ! (q->first_pkt && q->last_pkt) ) {
-        av_log(NULL, AV_LOG_ERROR, "line#%d - %s() return FALSE \n", __LINE__, __FUNCTION__ );
         return false;
     }
 
     int64_t min_pts = 0l;
     int64_t max_pts = 0l;
     if( ! scan_packetqueue_min_max_pts(q, &min_pts, &max_pts) ) {
-        av_log(NULL, AV_LOG_ERROR, "line#%d - %s() return FALSE \n", __LINE__, __FUNCTION__ );
         return false;
     }
 
@@ -3162,33 +3157,55 @@ static bool seek_within_stream_buffering_range( const char *prefix,
     double firstPktPts = min_pts * timeBase;
     double lastPktPts = max_pts * timeBase;
     if( ! (firstPktPts<=seekPos && seekPos<=lastPktPts) ) {
-        av_log(NULL, AV_LOG_ERROR, "line#%d - %s() return FALSE \n", __LINE__, __FUNCTION__ );
         return false;
     }
 
-    MyAVPacketList *keyPki = NULL;
+    MyAVPacketList *keyPki_0 = NULL; // last pkt's pts <= seekPos
+    MyAVPacketList *keyPki_1 = NULL; // first pkt's pts >= seekPos
     MyAVPacketList *pki = NULL;
     double streamTimeBaseQ = av_q2d( st->time_base );
     SDL_LockMutex(q->mutex);
     pki = q->first_pkt;
-    while(pki) { // scan for key-frame packet
-        double pts = pki->pkt.pts*streamTimeBaseQ;
-        if(seekPos <= pts) {//寻找最接近seekPos的关键帧
-            if(pki->pkt.flags&AV_PKT_FLAG_KEY){//是否关键帧
-                keyPki = pki;
+    while(pki && !(keyPki_0&&keyPki_1) ) { // care key-frame only
+        if( pki->pkt.flags&AV_PKT_FLAG_KEY ) {
+            double pts = pki->pkt.pts * streamTimeBaseQ;
+            if( pts <= seekPos ) {
+                keyPki_0 = pki;
             }
-            break;
-        }
-        if(pki->pkt.flags&AV_PKT_FLAG_KEY){
-            keyPki = pki;
+            if( pts >= seekPos ) {
+                keyPki_1 = pki;
+                break;
+            }
         }
         pki = pki->next;
     }
-    if(!keyPki) {
+    if(!keyPki_0) {
         SDL_UnlockMutex(q->mutex);
-        av_log(NULL, AV_LOG_ERROR, "line#%d - %s() return FALSE \n", __LINE__, __FUNCTION__ );
         return false;
     }
+    MyAVPacketList *keyPki = NULL;
+    double keyPkiPts;
+    
+    if( !keyPki_1 ) { // no bigger pts key-frame
+        keyPki = keyPki_0;
+        keyPkiPts = keyPki_0->pkt.pts * streamTimeBaseQ;
+    }else {
+        if( ! searchNearestKeyFrame ) {
+            keyPki = keyPki_0;
+            keyPkiPts = keyPki_0->pkt.pts * streamTimeBaseQ;
+        }else {
+            double keyPkiPts_0 = keyPki_0->pkt.pts * streamTimeBaseQ;
+            double keyPkiPts_1 = keyPki_1->pkt.pts * streamTimeBaseQ;
+            if( fabs(seekPos - keyPkiPts_0) < fabs(seekPos - keyPkiPts_1) ) {
+                keyPki = keyPki_0;
+                keyPkiPts = keyPkiPts_0;
+            }else {
+                keyPki = keyPki_1;
+                keyPkiPts = keyPkiPts_1;
+            }
+        }
+    }
+
 
     // prepare a MyAVPacketList for the cloned flush_pkt
     MyAVPacketList *flushPktClone = NULL;//从recycle_pkt中复用一个节点
@@ -3202,12 +3219,10 @@ static bool seek_within_stream_buffering_range( const char *prefix,
     }
     if(!flushPktClone) {
         SDL_UnlockMutex(q->mutex);
-        av_log(NULL, AV_LOG_ERROR, "line#%d - %s() return FALSE \n", __LINE__, __FUNCTION__ );
         return false;
     }
 
     // discard all packets before the keyPki
-    int discardPkiNum = 0;//把那个关键帧之前的所有节点移动到复用池
     while(q->first_pkt!=keyPki) {
         pki = q->first_pkt;
         q->first_pkt = q->first_pkt->next;
@@ -3216,11 +3231,7 @@ static bool seek_within_stream_buffering_range( const char *prefix,
         pki->next = q->recycle_pkt;
         q->recycle_pkt = pki;
 
-        discardPkiNum++;
     }
-    av_log(NULL, AV_LOG_ERROR, "seek_within_stream_buffering_range()[%s] discardPkiNum = %d \n",
-                    prefix, discardPkiNum
-                );
 
     // prepend flush_pkt to q
     flushPktClone->next = q->first_pkt;
@@ -3249,20 +3260,21 @@ static bool seek_within_stream_buffering_range( const char *prefix,
         pki = pki->next;
     }
     q->serial = serial; // set q->serial as last serial
-    SDL_CondSignal(q->cond);
-    SDL_UnlockMutex(q->mutex);
-    av_log(NULL, AV_LOG_ERROR, "seek_within_stream_buffering_range()[%s] return TRUE \n",
-                prefix
-            );
-    av_log(NULL, AV_LOG_ERROR, "line#%d - %s() return TRUE \n", __LINE__, __FUNCTION__ );
-    return true;
+    if(q->last_pkt != q->first_pkt) {
+        *realPos = keyPkiPts;
+        SDL_CondSignal(q->cond);
+        SDL_UnlockMutex(q->mutex);
+        return true;
+    } else {
+        SDL_UnlockMutex(q->mutex);
+        return false;
+    }
 }
 
 /*
  * If seek_pos within buffering range, handle it and return true.
  */
 static bool handle_seek_within_buffering_range(FFPlayer *ffp) {
-    av_log(NULL, AV_LOG_ERROR, "handle_seek_within_buffering_range() : ffp->seek_avoid_flush = %d \n", ffp->seek_avoid_flush );
     if( ! ffp->seek_avoid_flush ) {
         return false;
     }
@@ -3272,39 +3284,40 @@ static bool handle_seek_within_buffering_range(FFPlayer *ffp) {
     int64_t seek_pos = is->seek_pos; // in AV_TIME_BASE
     double seekPos = seek_pos * av_q2d( AV_TIME_BASE_Q );
 
-    int streamsNum = 0;
-    int successStreamsNum = 0;
-
-    if (is->audio_stream >= 0) {
-        streamsNum++;
-        bbc_dump_stream_q_info("audio-before", ffp, is->audio_st, &is->audioq );
-        if( seek_within_stream_buffering_range("audio", ffp, is->audio_st, &is->audioq, seekPos) ) {
-            successStreamsNum++;
-        }
-        bbc_dump_stream_q_info("audio-after", ffp, is->audio_st, &is->audioq );
-    }
-    if (is->subtitle_stream >= 0) {
-        streamsNum++;
-        bbc_dump_stream_q_info("subtitle-before", ffp, is->subtitle_st, &is->subtitleq );
-        if( seek_within_stream_buffering_range("subtitle", ffp, is->subtitle_st, &is->subtitleq, seekPos) ) {
-            successStreamsNum++;
-        }
-        bbc_dump_stream_q_info("subtitle-after", ffp, is->subtitle_st, &is->subtitleq );
-    }
     if (is->video_stream >= 0) {
-        streamsNum++;
-        bbc_dump_stream_q_info("video-before", ffp, is->video_st, &is->videoq );
-        if( seek_within_stream_buffering_range("video", ffp, is->video_st, &is->videoq, seekPos) ) {
+        //bbc_dump_stream_q_info("video-before", ffp, is->video_st, &is->videoq );
+        double realPos = 0.0;
+        if( seek_within_stream_buffering_range("video", ffp, is->video_st, &is->videoq, seekPos, 1, &realPos) ) {
+            seekPos = realPos; // use video's seek point time
             if (ffp->node_vdec) {
                 ffpipenode_flush(ffp->node_vdec);
             }
-            successStreamsNum++;
+        }else {
+            return false;
         }
-        bbc_dump_stream_q_info("video-after", ffp, is->video_st, &is->videoq );
+        //bbc_dump_stream_q_info("video-after", ffp, is->video_st, &is->videoq );
     }
 
-    bool ok = streamsNum == successStreamsNum;
-    return ok;
+    if (is->audio_stream >= 0) {
+        //bbc_dump_stream_q_info("audio-before", ffp, is->audio_st, &is->audioq );
+        double realPos = 0.0;
+        if( seek_within_stream_buffering_range("audio", ffp, is->audio_st, &is->audioq, seekPos, 0, &realPos) ) {
+            // nothing need to do
+        }else {
+            return false;
+        }
+        //bbc_dump_stream_q_info("audio-after", ffp, is->audio_st, &is->audioq );
+    }
+    if (is->subtitle_stream >= 0) {
+        //bbc_dump_stream_q_info("subtitle-before", ffp, is->subtitle_st, &is->subtitleq );
+        double realPos = 0.0;
+        if( seek_within_stream_buffering_range("subtitle", ffp, is->subtitle_st, &is->subtitleq, seekPos, 0, &realPos) ) {
+            // nothing need to do
+        }else {
+            return false;
+        }
+    }
+    return true;
 }
 
 static int bbc_buffer_is_full( FFPlayer *ffp ) {
