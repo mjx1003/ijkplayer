@@ -463,6 +463,14 @@ void IJKFFIOStatCompleteRegister(void (*cb)(const char *url,
     return _isVideoToolboxOpen;
 }
 
+- (int64_t)tcpSpeed {
+    if (!_mediaPlayer) {
+        return 0;
+    }
+    int64_t tcpSpeed = ijkmp_get_property_int64(_mediaPlayer, FFP_PROP_INT64_TCP_SPEED, 0);
+    return tcpSpeed;
+}
+
 inline static int getPlayerOption(IJKFFOptionCategory category)
 {
     int mp_category = -1;
